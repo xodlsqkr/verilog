@@ -1,0 +1,916 @@
+`timescale 1ns/1ps
+module EPS_DATA_MINING (nrst, clk, opt, test_mode, CAN_TXD, CAN_RXD, CAN_MON, CAN_MON2, UART_TXD, MON, MON2,
+						adc_csb, adc_sclk, adc_sdi, adc_sdo, adc_rstb, adc_daisy, adc_refselb,
+						debug1, debug2, debug3);	//top module
+	input nrst;				//PIN 238
+	input clk;				//PIN 30
+	input opt;				//PIN 52
+	
+	input [2:0] test_mode;	//PIN 39,38,37=>65	//for module mode_gen
+	
+	output CAN_TXD;			//PIN 114		//for module can_if
+	input CAN_RXD;			//PIN 113
+	input CAN_MON;			//PIN 110
+	input CAN_MON2;			//PIN 111
+	
+	output UART_TXD;		//PIN 9			//for module uart_if
+	
+	output MON, MON2;		//PIN 73,72
+	
+	output adc_csb;			//PIN 174  		//for module adc_ctrl
+	output adc_sclk;		//PIN 175
+	output adc_sdi;			//PIN 173
+	
+	input adc_sdo;			//PIN 177
+	output adc_rstb;		//PIN 171
+	output adc_daisy;		//PIN 170
+	output adc_refselb;		//PIN 168
+	output debug1, debug2, debug3;	//PIN 65=>37,64,66
+	
+	wire test_en, can_en; 
+	wire [2:0] test_mode_int;
+	
+	wire clk_2us;
+	wire clk_adc;
+	wire clk_25us;
+	
+	wire [11:0] adc_data;
+	wire [3:0] adc_ch;
+	
+	wire [239:0] uart_buf;	//160bit => 240bit by adding "SPD:????" 
+	wire [4:0] uart_size;	//5'd20 => 5'd30 by adding "SPD:????"
+	wire uart_ea, uart_ea_10x;
+	
+	wire [11:0] adc_ang1_data;
+	wire [11:0] adc_ang_data;
+	wire [11:0] adc_trq_data;
+	wire [11:0] trq_init_val;
+	
+	wire [4:0] fault_decision;
+	
+	wire [7:0] speed;
+		
+	assign adc_rstb = 1'b1;
+	assign adc_daisy = 1'b0;
+	assign adc_refselb = 1'b0;
+	
+	assign debug1 = CAN_RXD;
+	assign debug2 = adc_sdo;
+	assign debug3 = adc_csb;
+	assign MON2 = CAN_TXD;
+	
+	mode_gen U_mode(.nrst(nrst), .clk(clk_25us), .test_mode(3'b010), .test_en(test_en), .can_en(can_en), .test_mode_out(test_mode_int));
+	
+	can_if U_can(.nrst(nrst), .clk(clk), .clk_2us(clk_2us), .SEL(can_en), .RXD_OUT(CAN_TXD), .RXD(CAN_RXD), .speed(speed));//_IN(CAN_RXD), .FLAGMO(MON));
+
+	uart_if U_uart(.nrst(nrst), .clk(clk), .data_buf(uart_buf), .data_size(5'd30), .start(uart_ea), .TXD_OUT(UART_TXD));
+	
+	clock_gen U_clock(.nrst(nrst), .clk(clk), .ea(test_en), .clk_2us(clk_2us), .clk_adc(clk_adc), .clk_25us(clk_25us));
+	
+	adc_ctrl U_adc(.nrst(test_en), .clk(clk_adc), .adc_csb(adc_csb), .adc_sclk(adc_sclk), .adc_sdi(adc_sdi), .adc_sdo(adc_sdo), .adc_data(adc_data), .sdi_ch(adc_ch));
+	
+	data_reg U_reg(.nrst(test_en), .clk(clk), .test_mode(3'b010), .adc_csb(adc_csb), .adc_data(adc_data), .adc_ch(adc_ch), .fault_decision(fault_decision), .adc_ang1_data(adc_ang1_data), .adc_ang_data(adc_ang_data), .adc_trq_data(adc_trq_data), .trq_init_val(trq_init_val), .speed(speed), .uart_buf(uart_buf), .uart_size(uart_size), .uart_ea(uart_ea));
+	
+	fault_detection U_fault(.nrst(test_en), .clk(adc_ch[2]), .test_mode(3'b010), .uart_ea(uart_ea), .adc_ang1_data(adc_ang1_data), .adc_ang_data(adc_ang_data), .adc_trq_data(adc_trq_data), .can_mon(MON), .fault_decision(fault_decision), .trq_init(trq_init_val));
+	
+endmodule
+
+module fault_detection (nrst, clk, test_mode, uart_ea, adc_ang1_data, adc_ang_data, adc_trq_data, can_mon, fault_decision, trq_init);
+	input nrst;
+	input clk;
+	input [2:0] test_mode;
+	
+	input uart_ea;	
+	input [11:0] adc_ang1_data, adc_ang_data, adc_trq_data;
+	input can_mon;
+	
+	output reg [4:0] fault_decision;
+	output reg [11:0] trq_init;
+	
+	reg [4:0] fault_decision_temp;
+	
+	reg [4:0] can_op_cnt;	
+	reg [11:0] adc_ang1_max, adc_ang_max, adc_trq_max;
+//	reg [11:0] adc_trq_pre, adc_trq_delta, adc_trq_delta_max;
+
+	reg [4:0] init_cnt;
+	reg [2:0] pre_test_mode;
+	reg trq_init_flag;
+
+	always @(posedge can_mon or negedge nrst) begin
+		if(!nrst) begin
+			can_op_cnt <= 5'd0;
+		end
+		else begin
+			if(test_mode == 3'b001) begin
+				if(can_op_cnt >= 5'd10)
+					can_op_cnt <= 5'd10;
+				else
+					can_op_cnt <= can_op_cnt +1;
+			end
+			else begin
+				can_op_cnt <= 5'd0;
+			end
+		end
+	end
+	
+	always @(posedge clk or negedge nrst) begin
+		if(!nrst) begin
+			init_cnt <= 5'd0;
+			trq_init_flag <= 1'b0;
+			trq_init <= 12'd4000;
+			pre_test_mode <= 3'b000;
+		end
+		else begin
+			if(init_cnt >= 5'd30)
+				init_cnt <= 5'd30;
+			else
+				init_cnt <= init_cnt +1;
+			if((test_mode == 3'b001) && (pre_test_mode == 3'b000)) begin
+				trq_init_flag <= 1'b1;
+			end
+			if((trq_init_flag == 1'b1) && (init_cnt == 5'd29)) begin
+				trq_init <= adc_trq_data;
+				trq_init_flag <= 1'b0;
+			end
+			pre_test_mode <= test_mode;
+		end
+	end
+
+	always @(negedge clk or negedge nrst) begin
+		if(!nrst) begin
+			fault_decision_temp <= 5'b01110;
+			adc_ang1_max <= 12'd0;
+			adc_ang_max <= 12'd0;
+			adc_trq_max <= 12'd0;
+//			adc_trq_pre <= 12'd2220;
+//			adc_trq_delta <= 12'd0;
+//			adc_trq_delta_max <= 12'd0;
+		end
+		else begin
+			if((test_mode == 3'b001) && (init_cnt == 5'd30)) begin
+				if(adc_ang1_max < adc_ang1_data)
+					adc_ang1_max <= adc_ang1_data;
+				if(adc_ang_max < adc_ang_data)
+					adc_ang_max <= adc_ang_data;
+				if(adc_trq_max < adc_trq_data)
+					adc_trq_max <= adc_trq_data;
+//				if(adc_trq_pre > adc_trq_data)
+//					adc_trq_delta <= adc_trq_pre - adc_trq_data;
+//				else
+//					adc_trq_delta <= adc_trq_data - adc_trq_pre;
+//				adc_trq_pre <= adc_trq_data;
+//				if(adc_trq_delta_max < adc_trq_delta)
+//					adc_trq_delta_max <= adc_trq_delta;
+				if((adc_ang1_max < 12'd2200) || (adc_ang_max < 12'd40)) 	//Handwheel Fault Decision
+					fault_decision_temp[3] <= 1'b1;	
+				else
+					fault_decision_temp[3] <= 1'b0;
+				if(can_op_cnt < 5'd10)										//CAN Fault Decision
+					fault_decision_temp[2] <= 1'b1;
+				else
+					fault_decision_temp[2] <= 1'b0;
+				if(adc_trq_max < 12'd2572) //(trq_init+12'd200)) // trq_fault_treshold=10 //|| (adc_trq_delta_max < 12'd20)) //Motor Current(Torque) Fault Decision : (adc_trq_max < 12'd2240)@old
+					fault_decision_temp[1] <= 1'b1;	
+				else
+					fault_decision_temp[1] <= 1'b0;
+			end
+			else begin
+				fault_decision_temp <= 5'b01110;
+				adc_ang1_max <= 12'd0;
+				adc_ang_max <= 12'd0;
+				adc_trq_max <= 12'd0;
+//				adc_trq_pre <= 12'd2220;
+//				adc_trq_delta <= 12'd0;
+//				adc_trq_delta_max <= 12'd0;
+			end
+		end
+	end
+	always @(negedge uart_ea or negedge nrst) begin
+		if(!nrst) begin
+			fault_decision <= 5'b01110;
+		end
+		else begin
+			fault_decision <= fault_decision_temp;
+		end
+	end
+endmodule
+
+module data_reg (nrst, clk, test_mode, adc_csb, adc_data, adc_ch, fault_decision, adc_ang1_data, adc_ang_data, adc_trq_data, trq_init_val, speed, uart_buf, uart_size, uart_ea);
+	input nrst;
+	input clk;
+	input [2:0] test_mode;
+	
+	input adc_csb;	
+	input [11:0] adc_data;
+	input [3:0] adc_ch;
+	
+	input [4:0] fault_decision;
+	
+	output reg [11:0] adc_ang1_data;
+	output reg [11:0] adc_ang_data;
+	output reg [11:0] adc_trq_data;
+	input [11:0] trq_init_val;
+	
+	input [7:0] speed;	
+	
+	output reg [239:0] uart_buf;	//160bit => 240bit by adding "SPD:????"
+	output reg [4:0] uart_size;
+	output reg uart_ea;
+	
+	reg uart_ea_10x;
+	
+	reg mode_change_flag;
+	
+	reg [11:0] adc_ang2_data;
+	reg adc_ang_sign;
+	reg [18:0] adc_trq_sum;
+	reg [11:0] adc_trq_pre7;
+	reg [11:0] adc_trq_pre6;
+	reg [11:0] adc_trq_pre5;
+	reg [11:0] adc_trq_pre4;
+	reg [11:0] adc_trq_pre3;
+	reg [11:0] adc_trq_pre2;
+	reg [11:0] adc_trq_pre1;
+	reg [11:0] adc_trq_temp;
+	reg [11:0] adc_trq_cur;
+	
+	reg [7:0] adc_1000x, adc_100x, adc_10x, adc_1x;
+	reg [7:0] adc2_1000x, adc2_100x, adc2_10x, adc2_1x;
+	reg [7:0] speed_10x, speed_1x, speed_0p5x;
+	reg [239:0] uart_buf_temp;	//160bit => 240bit by adding "SPD:????"
+	reg [2:0] pre_test_mode;
+		
+	reg [5:0] uart_ea_cnt;
+	reg [5:0] uart_skip_cnt;
+
+	always @(posedge uart_ea_10x or negedge nrst) begin	//Skip UART Trasfer => Sampling Period is decreased
+		if(!nrst)begin
+			uart_skip_cnt <= 6'd0;	
+			uart_ea <= 1'b0;		
+		end
+		else begin
+			if(uart_skip_cnt > 9) begin
+				uart_skip_cnt <= 6'd0;	
+				uart_ea <= 1'b1;
+			end
+			else begin
+				if(uart_skip_cnt == 6'd8) begin
+					uart_ea <= 1'b0;
+				end
+				else begin
+					uart_ea <= 1'b1;
+				end
+				uart_skip_cnt <= uart_skip_cnt + 1;	
+			end
+		end
+	end
+			
+	always @(posedge adc_ch[2] or negedge nrst or negedge mode_change_flag) begin
+		if((!nrst) || (!mode_change_flag)) begin
+			uart_ea_cnt <= 6'd0;
+			uart_ea_10x <= 1'b0;
+		end
+		else begin
+			if(test_mode == 3'b000) begin
+				uart_ea_cnt <= 6'd0;
+				uart_ea_10x <= 1'b0;
+			end
+			else begin
+				uart_ea_cnt <= uart_ea_cnt + 1;	
+				if(uart_ea_cnt > 6'd35) begin	//UART Interval : 1ms@35, 1.4ms@49
+					uart_ea_cnt <= 6'd0;
+				end	
+				if(uart_ea_cnt > 6'd32) begin
+					uart_ea_10x <= 1'b0;	
+				end
+				else begin
+					uart_ea_10x <= 1'b1;
+				end
+			end			
+		end
+	end
+	
+	always @(negedge adc_csb or negedge nrst) begin
+		if(!nrst)begin
+			adc_ang1_data <= 12'h0;
+            		adc_ang2_data <= 12'h0;
+            		adc_ang_data <= 12'h0;
+            		adc_ang_sign <= 1'b0;
+            		adc_trq_sum <= 19'h0;
+            		adc_trq_pre7 <= 12'h0;
+            		adc_trq_pre6 <= 12'h0;
+            		adc_trq_pre5 <= 12'h0;
+            		adc_trq_pre4 <= 12'h0;
+            		adc_trq_pre3 <= 12'h0;
+            		adc_trq_pre2 <= 12'h0;
+            		adc_trq_pre1 <= 12'h0;
+            		adc_trq_cur <= 12'h0;
+			adc_trq_temp <= 12'h0;
+            		adc_trq_data <= 12'h0;
+		end
+		else begin
+			if(adc_ch == 4'd1) begin
+				adc_ang1_data <= adc_data;
+			end
+			if(adc_ch == 4'd2) begin
+				adc_ang2_data <= adc_data;
+			end
+			if(adc_ch == 4'd3) begin
+				adc_trq_pre7 <= adc_trq_pre6;
+				adc_trq_pre6 <= adc_trq_pre5;
+				adc_trq_pre5 <= adc_trq_pre4;
+				adc_trq_pre4 <= adc_trq_pre3;
+				adc_trq_pre3 <= adc_trq_pre2;
+				adc_trq_pre2 <= adc_trq_pre1;
+				adc_trq_pre1 <= adc_trq_cur;
+				adc_trq_cur <= adc_data;
+				adc_trq_sum <= adc_trq_pre7 + adc_trq_pre6 + adc_trq_pre5 + adc_trq_pre4 + adc_trq_pre3 + adc_trq_pre2 + adc_trq_pre1 + adc_trq_cur;
+				adc_trq_temp <= adc_trq_sum >> 3;
+				//if(adc_trq_temp < trq_init_val) // => 2384??
+					//adc_trq_data <= (trq_init_val - adc_trq_temp) + trq_init_val;
+				//else
+				if(adc_trq_temp < 12'd2372) // => 2384??
+					adc_trq_data <= (12'd2372 - adc_trq_temp) + 12'd2372;
+				else
+					adc_trq_data <= adc_trq_temp;
+//				if(adc_trq_pre2 >= adc_trq_pre1) begin
+//					if(adc_trq_pre2 >= adc_trq_cur) begin
+//						adc_trq_data <= adc_trq_pre2;
+//					end
+//				end
+//				if(adc_trq_pre1 >= adc_trq_pre2) begin
+//					if(adc_trq_pre1 >= adc_trq_cur) begin
+//						adc_trq_data <= adc_trq_pre1;
+//					end
+//				end
+//				if(adc_trq_cur >= adc_trq_pre2) begin
+//					if(adc_trq_cur >= adc_trq_pre1) begin
+//						adc_trq_data <= adc_trq_cur;
+//					end
+//				end
+				if(adc_ang1_data > adc_ang2_data) begin
+					adc_ang_data <= adc_ang1_data - adc_ang2_data;
+					adc_ang_sign <= 1'b0;
+				end
+				else begin
+					adc_ang_data <= adc_ang2_data - adc_ang1_data;
+					adc_ang_sign <= 1'b1;
+				end
+			end				
+		end
+	end
+	
+	always @(negedge clk or negedge nrst) begin
+		if(!nrst)begin
+			uart_buf_temp <= 240'h5F5F5F5F5F5F5F5F5F2C5F5F5F5F5F5F5F5F5F2C5F5F5F5F5F5F5F5F5F0A;
+			adc2_1000x <= 8'd0;
+            		adc2_100x <= 8'd0;
+            		adc2_10x <= 8'd0;
+            		adc2_1x <= 8'd0;
+			adc_1000x <= 8'd0;
+            		adc_100x <= 8'd0;
+            		adc_10x <= 8'd0;
+            		adc_1x <= 8'd0;
+            		speed_10x <= 8'd0;
+            		speed_1x <= 8'd0;
+            		speed_0p5x <= 8'd0;
+           		pre_test_mode <= 3'b000;
+           		mode_change_flag <= 1'b1;
+		end
+		else begin
+			if(test_mode == 3'b000) begin
+				uart_buf_temp <= 240'h5F5F5F5F5F5F5F5F5F2C5F5F5F5F5F5F5F5F5F2C5F5F5F5F5F5F5F5F5F0A;
+				pre_test_mode <= 3'b000;
+				mode_change_flag <= 1'b1;
+			end
+			else begin
+				if(test_mode == 3'b001) begin
+					uart_buf_temp[79:48] <= 32'h464C543A;
+					if(fault_decision[4])
+						uart_buf_temp[47:40] <= 8'h31;
+					else
+						uart_buf_temp[47:40] <= 8'h30;
+					if(fault_decision[3])
+						uart_buf_temp[39:32] <= 8'h31;
+					else
+						uart_buf_temp[39:32] <= 8'h30;
+					if(fault_decision[2])
+						uart_buf_temp[31:24] <= 8'h31;
+					else
+						uart_buf_temp[31:24] <= 8'h30;
+					if(fault_decision[1])
+						uart_buf_temp[23:16] <= 8'h31;
+					else
+						uart_buf_temp[23:16] <= 8'h30;
+					if(fault_decision[0])
+						uart_buf_temp[15:8] <= 8'h31;
+					else
+						uart_buf_temp[15:8] <= 8'h30;
+					uart_buf_temp[7:0] <= 8'h0A;
+					pre_test_mode <= 3'b001;
+					mode_change_flag <= 1'b1;
+				end
+				else begin
+					if(pre_test_mode == 3'b001) begin
+						if(uart_ea_cnt < 6'd13) begin
+							pre_test_mode <= 3'b001;
+							if(uart_ea_cnt == 6'd11) begin
+								mode_change_flag <= 1'b0;	
+							end
+							if(uart_ea_cnt == 6'd0) begin
+								mode_change_flag <= 1'b1;
+								pre_test_mode <= test_mode;		
+							end
+						end
+						else begin
+							mode_change_flag <= 1'b0;
+							pre_test_mode <= test_mode;	
+						end
+					end
+					else begin
+						pre_test_mode <= test_mode;
+						mode_change_flag <= 1'b1;
+						adc2_1000x <= adc_ang_data/1000;
+            					adc2_100x <= (adc_ang_data-adc2_1000x*1000)/100;
+            					adc2_10x <= (adc_ang_data-adc2_1000x*1000-adc2_100x*100)/10;
+            					adc2_1x <= adc_ang_data-adc2_1000x*1000-adc2_100x*100-adc2_10x*10;
+						adc_1000x <= adc_trq_data/1000;
+            					adc_100x <= (adc_trq_data-adc_1000x*1000)/100;
+            					adc_10x <= (adc_trq_data-adc_1000x*1000-adc_100x*100)/10;
+            					adc_1x <= adc_trq_data-adc_1000x*1000-adc_100x*100-adc_10x*10;
+						//adc_1000x <= trq_init_val/1000;
+            					//adc_100x <= (trq_init_val-adc_1000x*1000)/100;
+            					//adc_10x <= (trq_init_val-adc_1000x*1000-adc_100x*100)/10;
+            					//adc_1x <= trq_init_val-adc_1000x*1000-adc_100x*100-adc_10x*10;
+            					speed_10x <= speed/20;
+            					speed_1x <= (speed-speed_10x*20)/2;
+            					if((speed%2)==1)
+            						speed_0p5x <= 5;
+            					else 
+            						speed_0p5x <= 0;
+						uart_buf_temp[239:208] <= 40'h5350443A;
+						uart_buf_temp[207:200] <= 8'h2B;
+						uart_buf_temp[199:192] <= speed_10x+8'h30;
+            					uart_buf_temp[191:184] <= speed_1x+8'h30;
+            					uart_buf_temp[183:176] <= 8'h2E;
+            					uart_buf_temp[175:168] <= speed_0p5x+8'h30;
+            					uart_buf_temp[167:160] <= 8'h2C;
+						uart_buf_temp[159:128] <= 40'h414E473A;
+						if(adc_ang_sign) begin
+							uart_buf_temp[127:120] <= 8'h2B;
+						end	
+						else begin
+							uart_buf_temp[127:120] <= 8'h2D;
+						end	
+						uart_buf_temp[119:112] <= adc2_1000x+8'h30;
+            					uart_buf_temp[111:104] <= adc2_100x+8'h30;
+            					uart_buf_temp[103:96] <= adc2_10x+8'h30;
+            					uart_buf_temp[95:88] <= adc2_1x+8'h30;
+            					uart_buf_temp[87:80] <= 8'h2C;
+						uart_buf_temp[79:40] <= 40'h5452513A2B;
+						uart_buf_temp[39:32] <= adc_1000x+8'h30;
+            					uart_buf_temp[31:24] <= adc_100x+8'h30;
+            					uart_buf_temp[23:16] <= adc_10x+8'h30;
+            					uart_buf_temp[15:8] <= adc_1x+8'h30;
+            					uart_buf_temp[7:0] <= 8'h0A;
+					end
+				end
+			end 
+		end
+	end
+	
+	always @(posedge uart_ea or negedge nrst) begin
+		if(!nrst)begin
+			uart_buf <= 240'h5F5F5F5F5F5F5F5F5F2C5F5F5F5F5F5F5F5F5F2C5F5F5F5F5F5F5F5F5F0A;
+			uart_size <= 5'd0;
+		end
+		else begin
+			uart_buf <= uart_buf_temp;
+			if(test_mode == 3'b000) begin
+				uart_size <= 5'd0;
+			end
+			else begin
+				if(test_mode == 3'b001) begin
+					uart_size <= 5'd10;
+				end
+				else begin
+					uart_size <= 5'd20;
+				end
+			end
+		end
+	end
+endmodule
+
+module mode_gen (nrst, clk, test_mode, test_en, can_en, test_mode_out);
+	input nrst;
+	input clk;
+	input [2:0] test_mode;
+	
+	output wire test_en;
+	output reg can_en;
+	output reg [2:0] test_mode_out;
+	
+	reg [2:0] test_mode_pre;
+	
+	assign test_en = can_en & nrst;
+	
+	always @(posedge clk or negedge nrst) begin
+		if(!nrst)begin
+			can_en <= 1'b0;
+			test_mode_pre <= 3'b000;
+			test_mode_out <= 3'b000;
+		end
+		else begin
+			if(test_mode == 3'b000) begin
+				can_en <= 1'b0;
+			end
+			else begin
+				can_en <= 1'b1;
+			end
+			if(test_mode == test_mode_pre) begin
+				test_mode_out <= test_mode;
+			end
+			test_mode_pre <= test_mode;
+		end
+	end
+endmodule
+
+module can_if (nrst, clk, clk_2us, SEL, RXD_OUT, RXD, speed);
+//module can_if (nrst, clk, clk_2us, SEL, RXD_OUT, RXD_IN, FLAGMO); //send KEY_Signal once after CAN ACK Signal
+	input nrst;
+	input clk;
+	input clk_2us;
+	input SEL; //can_en
+	input RXD;	
+	output RXD_OUT; 
+	output reg [7:0] speed;	
+	
+        
+        assign RXD_OUT = 1'b1;    
+          
+        wire [35:0] CAN_ID = 36'b110001100001100000100011000001001000;
+             
+        reg [7:0] count_for_can_start;
+        reg flag_can_start;
+        reg [7:0] pre_speed;
+        
+	reg [7:0] count_for_can_reg;
+        reg [143:0] RXD_BUF;
+        reg [143:0] RXD_REG;
+
+always@(negedge clk_2us or negedge nrst) begin
+	if(!nrst) begin
+      		count_for_can_start <= 8'd0;
+     		 flag_can_start <= 1'b0;
+     		 count_for_can_reg <= 8'd144;
+      		RXD_BUF <= 144'd0;
+   	end
+ 
+  	else begin
+      		if(RXD) begin
+         		if(count_for_can_start < 11) //?? and (flag_can_end == 1'b1)
+            			count_for_can_start <= count_for_can_start +1;
+      		end
+      		else begin
+        		count_for_can_start <= 0;
+      		end
+		if(count_for_can_start>=11) begin
+      			count_for_can_reg<=1;
+      			if(!RXD)begin
+      				count_for_can_reg<=8'd144;
+    				flag_can_start <= 1'b1;
+    			end
+      		end
+     		else begin
+        		if(count_for_can_reg > 1) begin
+             			RXD_BUF[count_for_can_reg-1] <= RXD;
+        		end
+      			count_for_can_reg <= count_for_can_reg -1;
+      			flag_can_start <= 1'b0;
+      		end
+   	end
+end
+
+always@(posedge clk_2us or negedge nrst) begin
+	if(!nrst) begin
+		RXD_REG <= 144'd0;
+   	end
+   	else begin
+   		if(count_for_can_reg == 8'd1)
+   			RXD_REG <= RXD_BUF;
+   	end
+end
+
+always@(negedge clk_2us or negedge nrst) begin
+	if(!nrst) begin
+		speed <= 8'd0;
+      		pre_speed <= 8'd0;
+   	end
+   	else begin
+   		if(RXD_REG[143:108] == CAN_ID) begin
+			case(RXD_REG[64:56])
+				9'b000001000: speed <= 8'd0;//8'b00000000;
+				9'b000001001: speed <= 8'd1;//8'b00000001;
+				9'b000001010: speed <= 8'd2;//8'b00000010;
+				9'b000001011: speed <= 8'd3;//8'b00000011;
+				9'b000001100: speed <= 8'd4;//8'b00000100;
+				9'b000001101: speed <= 8'd5;//8'b00000101;
+				9'b000001110: speed <= 8'd6;//8'b00000110;
+				9'b000001111: speed <= 8'd7;//8'b00000111;
+				//9'b000010000: speed <= 8'd8;
+				9'b100000100: speed <= 8'd128;//8'b10000000;
+				9'b100000101: speed <= 8'd129;//8'b10000001;
+				9'b010000010: speed <= 8'd64;//8'b01000001;
+				9'b011111010: speed <= 8'd126;
+				9'b011111001: speed <= 8'd125;
+				9'b011111011: speed <= 8'd127;
+				9'b001111101: speed <= 8'd63;
+				default : speed <= RXD_REG[64:57];
+			endcase
+   	      //speed <= RXD_REG[64:57];
+			if(pre_speed>15) begin
+				if((speed<(pre_speed+15)) && (speed>(pre_speed-15))) begin
+					pre_speed <= speed;
+				end
+				else begin
+					speed <= pre_speed;
+				end
+			end
+			else begin
+				if(speed<(pre_speed+15))begin
+						pre_speed <= speed;
+				end
+				else begin
+					speed<=pre_speed;
+				end
+			end
+		end
+	end
+end
+
+endmodule
+
+module uart_if (nrst, clk, data_buf, data_size, start, TXD_OUT);
+	input nrst;
+	input clk;
+	input [239:0] data_buf;		//160bit => 240bit by adding "SPD:????"
+	input [4:0] data_size;
+	input start;
+	
+	output reg TXD_OUT;
+	
+	reg [3:0] state;
+	reg [9:0] uart_count;
+	reg [4:0] data_count;
+	reg [4:0] buf_count;
+	
+	always @(posedge clk or negedge nrst) begin
+		if(!nrst) begin
+			uart_count <= 10'd0;
+			state <= 0; //Idle
+			data_count <= 5'd0;
+			buf_count <= 5'd0;
+			TXD_OUT <= 1'b1;
+		end
+		else begin
+			if((data_count < data_size) && start) begin
+				buf_count <= data_size - data_count - 5'd1;
+				if(uart_count == 693) begin		//Baudrate : 57600@693, 115200@347, 460800@86
+					uart_count <= 0;
+					state <= state + 1;
+					if(state == 2) begin //START_ST
+						TXD_OUT <= 1'b0;
+					end
+					else if(state == 3) begin //D0
+						TXD_OUT <= data_buf[buf_count * 8 + 0];
+					end
+					else if(state == 4) begin //D1
+						TXD_OUT <= data_buf[buf_count * 8 + 1];
+					end
+					else if(state == 5) begin //D2
+						TXD_OUT <= data_buf[buf_count * 8 + 2];
+					end
+					else if(state == 6) begin //D3
+						TXD_OUT <= data_buf[buf_count * 8 + 3];
+					end
+					else if(state == 7) begin //D4
+						TXD_OUT <= data_buf[buf_count * 8 + 4];
+					end
+					else if(state == 8) begin //D5
+						TXD_OUT <= data_buf[buf_count * 8 + 5];
+					end
+					else if(state == 9) begin //D6
+						TXD_OUT <= data_buf[buf_count * 8 + 6];
+					end
+					else if(state == 10) begin //D7
+						TXD_OUT <= data_buf[buf_count * 8 + 7];
+					end
+					else if(state == 11) begin //STOP
+							TXD_OUT <= 1'b1;
+							state <= 0;
+							data_count <= data_count + 1;
+					end
+					else begin
+						TXD_OUT <= 1'b1;
+					end
+				end
+				else begin
+					uart_count <= uart_count + 1;
+				end
+			end
+			else begin
+				if(!start) begin
+					uart_count <= 10'd0;
+					state <= 0;
+					data_count <= 5'd0;
+					buf_count <= 5'd0;
+					TXD_OUT <= 1'b1;
+				end
+			end
+		end
+	end
+endmodule
+					
+module clock_gen (clk, nrst, ea, clk_2us, clk_adc, clk_25us);
+	input clk;
+	input nrst;
+	input ea;
+	
+	output reg clk_2us;
+	output reg clk_adc;
+	output reg clk_25us;
+	
+	reg [5:0]count_2us;
+	reg [16:0] count_adc;
+	reg [9:0] count_25us;
+	
+	always @(posedge clk or negedge nrst)begin
+		if(!nrst) begin
+			count_2us <= 6'd0;
+			count_adc <= 17'd0;
+			count_25us <= 10'd0;		
+			clk_2us <= 1'b0;
+			clk_adc <= 1'b0;
+			clk_25us <= 1'b0;
+		end
+		else begin
+			count_2us <= count_2us + 1;
+			count_25us <= count_25us + 1;			
+			if(count_2us == 6'd39) begin		//OLD(2us) : 39, NEW(1us) : 19
+				clk_2us <= ~clk_2us;
+				count_2us <= 6'd0;
+			end
+			if(count_25us == 10'd499) begin
+				clk_25us <= ~clk_25us;
+				count_25us <= 10'd0;
+			end
+			if(ea) begin
+//				count_adc <= count_adc + 1;
+//				if(count_adc == 17'd199) begin	//Sampling rate=5.52ms@199, 2.76ms@99
+					clk_adc <= ~clk_adc;		//Sampling rate=27.6us@no-counter
+//					count_adc <= 17'd0;
+//				end
+			end
+			else begin
+				clk_adc <= 1'b0;
+				count_adc <= 17'd0;	
+			end
+		end
+	end
+endmodule
+
+module adc_ctrl (nrst, clk, adc_csb, adc_sclk, adc_sdi, adc_sdo, adc_data, sdi_ch);
+	input nrst;
+	input clk;
+	output reg adc_csb;
+	output reg adc_sclk;
+	output reg adc_sdi;
+	input  adc_sdo;
+	output reg [11:0] adc_data;
+	output reg [3:0] sdi_ch;
+
+	reg [6:0] clk_cnt;
+	reg [6:0] sclk_cnt;
+   
+	reg [1:0] rst_flag;
+	reg [1:0] delay;
+
+	reg [11:0] adc_data_temp;
+
+	always @(negedge clk or negedge nrst) begin
+		if(!nrst) begin // reset
+        		clk_cnt <= 7'd0;
+		end
+		else begin
+        		if(clk_cnt == 7'd68)
+            			clk_cnt <= 7'd0; // clk reset
+        		else
+            			clk_cnt <= clk_cnt + 1; // clk count
+    		end
+	end
+	
+	always @(posedge clk or negedge nrst) begin
+    		if(!nrst) begin // reset
+        		adc_csb <= 1'b1;
+        		sclk_cnt <= 7'd0;
+        		adc_sclk <= 1'b0;
+        		adc_sdi <= 1'b0;
+        		rst_flag <= 2'd0;
+        		delay <= 2'd0; //adc_sclk, adc_sdi delay set
+        	end
+		else begin
+        	//adc_csb
+        		if(clk_cnt >= 7'd66)
+            			adc_csb <= 1'b1;
+        		else
+            			adc_csb <= 1'b0;
+        	//adc_sdi
+        		if(sdi_ch == 4'd8) begin
+        			if(clk_cnt == 1 || clk_cnt == 2 || clk_cnt == 5 || clk_cnt == 6)
+           				adc_sdi <= 1'b1;
+        			else
+           				adc_sdi <= 1'b0;
+        		end
+			else begin
+    	   			adc_sdi <= 1'b0;
+			end
+
+        		if(adc_csb == 1'b1) begin
+            			sclk_cnt <= 7'd0; //sclk count reset
+            			rst_flag <= 2'b0; // rst_flag reset
+            		end
+        		else begin        
+            			if(rst_flag >= 2'd3)
+                			rst_flag <= 2'd3;
+            			else
+                			rst_flag <= rst_flag + 1; // rst_flag count       
+            			if(rst_flag >= delay) begin //adc_sclk, adc_sdi delay
+                			adc_sclk <= ~adc_sclk; //adc_sclk generate
+                			if(adc_sclk)
+                    				sclk_cnt <= sclk_cnt + 1; // adc_sclk count
+                			else if(sclk_cnt > 31)
+                    				adc_sclk <= 1'b0; // adc_sclk count reset
+            			end
+			end
+    		end
+	end
+
+	always @(negedge clk or negedge nrst) begin
+    		if(!nrst) begin // reset
+        		adc_data_temp <= 12'd0;
+    		end
+    		else begin
+    	//adc_data
+//			case(sdi_ch)
+// 			4'd0 : begin
+			if(clk_cnt == 7'd33)
+				adc_data_temp[11] <= adc_sdo;
+			else if(clk_cnt == 7'd35)
+				adc_data_temp[10] <= adc_sdo;
+			else if(clk_cnt == 7'd37)
+				adc_data_temp[9] <= adc_sdo;
+			else if(clk_cnt == 7'd39)
+				adc_data_temp[8] <= adc_sdo;
+			else if(clk_cnt == 7'd41)
+				adc_data_temp[7] <= adc_sdo;
+			else if(clk_cnt == 7'd43)
+				adc_data_temp[6] <= adc_sdo;
+			else if(clk_cnt == 7'd45)
+				adc_data_temp[5] <= adc_sdo;
+			else if(clk_cnt == 7'd47)
+				adc_data_temp[4] <= adc_sdo;
+			else if(clk_cnt == 7'd49)
+				adc_data_temp[3] <= adc_sdo;
+			else if(clk_cnt == 7'd51)
+				 adc_data_temp[2] <= adc_sdo;
+			else if(clk_cnt == 7'd53)
+				adc_data_temp[1] <= adc_sdo;
+			else if(clk_cnt == 7'd55)
+				adc_data_temp[0] <= adc_sdo;
+//			end
+//			//default : adc_data <= 12'd0;
+//			endcase
+		end
+	end
+
+	always @(posedge adc_csb or negedge nrst) begin
+    		if(!nrst) begin // reset
+        		adc_data <= 12'd0;
+    		end
+    		else begin
+			adc_data <= adc_data_temp;
+    		end
+	end
+
+	always @(posedge adc_csb or negedge nrst) begin // adc_sclk, adc_sdi delay
+    		if(!nrst) //adc_sdi output set
+        		sdi_ch = 4'd8; // sdi_ch reset
+    		else begin
+        		if(sdi_ch >= 4'd7)
+            			sdi_ch = 4'd0;
+        		else
+            			sdi_ch = sdi_ch + 1;
+        	end
+    	end 
+endmodule
