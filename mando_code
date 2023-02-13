@@ -1,0 +1,394 @@
+`timescale 1ns/1ps
+module EPS_DATA_MINING(nrst, clk, opt, test_mode, CAN_TXD, CAN_MON, UART_TXD, MON); //top module
+	input nrst;
+	input clk;
+	input opt;
+	
+	input [2:0] test_mode;	//for module mode_gen
+	
+	output CAN_TXD;			//for module can_if
+	input CAN_MON;
+	
+	output UART_TXD;			//for module uart_if
+	
+	output MON;
+	output HANDLE_SENT;
+	wire test_en, can_en;
+	
+	wire clk_2us;
+	wire clk_2ms;
+	wire clk_25us;
+	
+	mode_gen U_mode(.nrst(nrst), .clk(clk), .test_mode(test_mode), .test_en(test_en), .can_en(can_en));
+	
+	can_if U_can(.nrst(nrst), .clk(clk), .clk_2us(clk_2us), .start(can_en), .SEL(opt), .RXD_OUT(CAN_TXD), .RXD_IN(CAN_MON), .FLAGMO(MON));
+	
+	uart_if U_uart(.nrst(nrst), .clk(clk), .start(test_en), .TXD_OUT(UART_TXD));
+	
+	clock_gen U_clock(.nrst(nrst), .clk(clk), .clk_2us(clk_2us), .clk_2ms(clk_2ms), .clk_25us(clk_25us));
+
+	handle_signal U_handle(.nrst(nrst), .clk(clk), .clk_2us(clk_2us), .RXD_OUT(HANDLE_SENT));
+	
+endmodule
+
+module mode_gen(nrst, clk, test_mode, test_en, can_en);
+	input nrst;
+	input clk;
+	input [2:0] test_mode;
+	
+	output wire test_en;
+	output reg can_en;
+	
+	assign test_en = can_en;
+	
+	always @(posedge clk or negedge nrst)begin
+		if(!nrst)begin
+			can_en <= 1'b0;
+		end
+		else begin
+			if(test_mode == 3'b001)begin
+				can_en <= 1'b1;
+			end
+			else begin
+				can_en <= 1'b0;
+			end
+		end
+	end
+endmodule
+
+module can_if(nrst, clk, clk_2us, start, SEL, RXD_OUT, RXD_IN, FLAGMO); //send KEY_Signal once after CAN ACK Signal
+	input nrst;
+	input clk;
+	input clk_2us;
+	input start; //=can_en
+	input SEL;
+	input RXD_IN;
+	
+	output reg RXD_OUT; 
+	output wire FLAGMO;
+	assign FLAGMO = HOLD_FLAG;
+	
+	wire [277:0] RXD_ON;
+	assign RXD_ON =  278'b11111001100000011111111000011111100111100000000001100000000001100111100000000000110000000000110000000000110000000000110000000000110000000000110000000000110000000000011000000000011000000000011000000000011000000110000110000000000111100000001100000000001111000000001111000000111100;
+	
+	wire [277:0] RXD_OFF;
+	assign RXD_OFF = 278'b11111001100110000110011000011001111000000001100000000001100000000000110000000000110000000000110000000000110000000000110000000000110000000000110000000000110000000000011000000000011000000000011000000000011000000110000110000000000111100000001100000000001111000000001111000000111100;
+	
+	wire [277:0] RXD_TEMP; 
+	//assign RXD_TEMP = (start == 1'b1) ? RXD_ON : RXD_OFF;
+	assign RXD_TEMP = (SEL == 1'b1) ? RXD_ON : RXD_OFF;	
+	//////////////////////////////////////////////////////
+	reg start_rst;
+	
+	always @(start)begin
+		start_rst <= 1'b1;
+		start_rst <= ~start_rst;
+		#4000 start_rst <= ~start_rst;
+	end	
+
+	///////////////////////////////////////////////////////////////
+	reg [9:0] RXD_HIGH_count;
+	reg RXD_HIGH_FLAG;
+	
+	always @(posedge clk_2us or negedge nrst) begin
+		if (!nrst) begin
+			RXD_HIGH_count <= 10'd0;
+			RXD_HIGH_FLAG <= 1'b0;
+		end
+		////////////////////////////////////////////////////////////////////////////////////////
+//		else if(!start_rst)begin
+//			RXD_HIGH_count <= 10'd0;
+//			RXD_HIGH_FLAG <= 1'b0;
+//		end
+		////////////////////////////////////////////////////////////////////////////////////////
+		else begin
+			if(RXD_IN && CAN_TXD_INGB) begin
+				RXD_HIGH_count <= RXD_HIGH_count +1;
+				if(RXD_HIGH_count > 40)  begin
+					RXD_HIGH_FLAG <= 1'b1;
+					RXD_HIGH_count <= 10'd50;
+				end
+			end
+			else begin
+				if(CAN_TXD_INGB)begin
+					RXD_HIGH_count <= 10'd0;
+					RXD_HIGH_FLAG <= 1'b0;
+				end
+			end
+		end
+	end
+	//////////////////////////////////////////////////////////////
+	reg HOLD_FLAG;
+	reg [8:0] count;
+	reg CAN_TXD_INGB;
+	
+	always @(posedge clk_2us or negedge nrst)begin
+		if(!nrst)begin
+			RXD_OUT <= 1'b1;
+			count <= 9'b0;
+			HOLD_FLAG <= 1'b0;
+			CAN_TXD_INGB <= 1'b1;
+		end
+		////////////////////////////////////////////////////////////////////////////////////////
+//		else if(!start_rst)begin
+//			RXD_OUT <= 1'b1;
+//			count <= 9'b0;
+//			HOLD_FLAG <= 1'b0;
+//			CAN_TXD_INGB <= 1'b1;
+//		end
+		////////////////////////////////////////////////////////////////////////////////////////
+		else begin
+			if(RXD_HIGH_FLAG)begin
+				HOLD_FLAG <= 1'b1;
+				if(HOLD_FLAG) begin
+					if(count != 9'b100010110)begin
+						CAN_TXD_INGB <= 1'b0;
+						RXD_OUT <= RXD_TEMP[count];
+						count <= count + 1;
+					end
+					if (count == 9'b100010110) begin
+						CAN_TXD_INGB <= 1'b1;
+						RXD_OUT <= 1'b1;
+						HOLD_FLAG <= 1'b0;
+					end
+				end
+			end
+		end
+	end
+	/////////////////////////////////////////////////////////////////
+endmodule
+
+module handle_signal(nrst, clk, clk_2us, RXD_OUT); //send KEY_Signal once after CAN ACK Signal
+	input nrst;
+	input clk;
+	input clk_2us;
+	
+	output reg RXD_OUT; 
+	
+	wire [263:0] SENT;
+	assign SENT =  264'b111111000000000000000000000000000000000000000000111111000000000001111110000000000011111100000000000000111111000000000000000001111110000000000000111111000000000111111000000000000111111000000000000000111111000000000000000000000000000000000000000000000000000000000000;
+	
+	wire [263:0] RXD_OUT;
+
+	always @(posedge clk_2us or negedge nrst)begin
+		if(!nrst)begin
+			RXD_OUT <= 1'b1;
+			count <= 9'b0;
+		end
+		else begin
+			if(count != 9'b100000111)begin
+				RXD_OUT <= SENT[263-count];
+				count <= count + 1;
+			end
+			if (count == 9'b100000111) begin
+				RXD_OUT <= 1'b1;
+			end
+		end
+	end
+endmodule
+
+module uart_if(nrst, clk, start, TXD_OUT);
+	input nrst;
+	input clk;
+	input start;
+	
+	output reg TXD_OUT;
+	parameter [79:0] data_angle = 80'h414E473A2B303732300A;
+	//parameter [79:0] data_angle = 80'h0A303237302B3A474E41;
+	
+	parameter [79:0] data_torque = 80'h5452513A2B31332E320A;
+	//parameter [79:0] data_torque = 80'b0A322E33312B3A515254;
+	
+	reg sel;
+	
+	wire [79:0] data_TEMP;
+	assign data_TEMP = (sel == 1'b1) ? data_torque : data_angle;
+	
+/*
+	parameter Idle = 0,
+				 START_ST = 1,
+				 D0 = 2,
+				 D1 = 3,
+				 D2 = 4,
+				 D3 = 5,
+				 D4 = 6,
+				 D5 = 7,
+				 D6 = 8,
+				 D7 = 9,
+				 STOP = 10;
+*/	
+	
+	reg [3:0] state;
+	reg [8:0] uart_count;
+	reg [3:0] data_count;
+	
+	always @(posedge clk or negedge nrst)begin
+		if(!nrst) begin
+			uart_count <= 9'b0;
+			state <= 1; //Idle
+			data_count <= 9;
+			sel <= 1'b0;
+			TXD_OUT <= 1'b1;
+		end
+		else begin
+			if(uart_count == 347)begin
+				uart_count <= 0;
+				state <= state + 1;
+				if(state == 2) begin //START_ST
+					TXD_OUT <= 1'b0;
+				end
+				else if(state == 3)begin //D0
+					TXD_OUT <= data_TEMP[data_count * 8 + 0];
+				end
+				else if(state == 4)begin //D1
+					TXD_OUT <= data_TEMP[data_count * 8 + 1];
+				end
+				else if(state == 5)begin //D2
+					TXD_OUT <= data_TEMP[data_count * 8 + 2];
+				end
+				else if(state == 6)begin //D3
+					TXD_OUT <= data_TEMP[data_count * 8 + 3];
+				end
+				else if(state == 7)begin //D4
+					TXD_OUT <= data_TEMP[data_count * 8 + 4];
+				end
+				else if(state == 8)begin //D5
+					TXD_OUT <= data_TEMP[data_count * 8 + 5];
+				end
+				else if(state == 9)begin //D6
+					TXD_OUT <= data_TEMP[data_count * 8 + 6];
+				end
+				else if(state == 10)begin //D7
+					TXD_OUT <= data_TEMP[data_count * 8 + 7];
+				end
+				else if(state == 11)begin //STOP
+					if(data_count == 0)begin
+						TXD_OUT <= 1'b1;
+						state <= 0;
+						data_count <= 9;
+						sel <= ~sel;
+					end
+					else begin
+						TXD_OUT <= 1'b1;
+						state <= 0;
+						data_count <= data_count - 1;
+					end
+				end
+				else begin
+					TXD_OUT <= 1'b1;
+				end
+			end
+			else begin
+				uart_count <= uart_count + 1;
+			end
+		end
+	end
+endmodule
+					
+/*			
+	always @(state) begin
+		case(state)
+			Idle : TXD_OUT <= 1;
+			START_ST : TXD_OUT <= 0;
+			D0 : TXD_OUT <= data_TEMP[data_count * 8 + 0];
+			D1 : TXD_OUT <= data_TEMP[data_count * 8 + 1];
+			D2 : TXD_OUT <= data_TEMP[data_count * 8 + 2];
+			D3 : TXD_OUT <= data_TEMP[data_count * 8 + 3];
+			D4 : TXD_OUT <= data_TEMP[data_count * 8 + 4];
+			D5 : TXD_OUT <= data_TEMP[data_count * 8 + 5];
+			D6 : TXD_OUT <= data_TEMP[data_count * 8 + 6];
+			D7 : TXD_OUT <= data_TEMP[data_count * 8 + 7];
+			STOP : TXD_OUT <= 1;
+			default : TXD_OUT <= 1;
+		endcase
+	end
+	
+	always @(posedge clk or negedge nrst)begin
+		if(!nrst) begin
+			uart_count <= 9'b0;
+			state <= 4'b0;
+			data_count <= 4'b0;
+			sel <= 1'b0;
+		end
+		else begin
+			if(uart_count == 347)begin
+				uart_count <= 0;
+				case(state)
+					Idle : state <= START_ST;
+					START_ST : state <= D0;
+					D0 : state <= D1;
+					D1 : state <= D2;
+					D2 : state <= D3;
+					D3 : state <= D4;
+					D4 : state <= D5;
+					D5 : state <= D6;
+					D6 : state <= D7;
+					D7 : state <= STOP;
+					STOP : state <= Idle;
+					default : state <= START_ST;
+				endcase
+				if(state == Idle)begin
+					data_count <= data_count + 1;
+					if(data_count == 9)begin
+						data_count <= 4'b0;
+						sel <= ~sel;
+					end
+				end
+			end
+			else begin
+				uart_count <= uart_count + 1;
+			end
+		end
+	end
+endmodule 
+*/
+
+
+module clock_gen(clk, nrst, clk_2us, clk_2ms, clk_25us);
+	input clk;
+	input nrst;
+	
+	output reg clk_2us;
+	output reg clk_2ms;
+	output reg clk_25us;
+	
+	reg [5:0]count_2us;
+	reg [16:0] count_2ms;
+	reg [9:0] count_25us;
+	
+	always @(posedge clk or negedge nrst)begin
+		if(!nrst)begin
+			count_2us <= 6'b0;
+			count_2ms <= 17'b0;
+			count_25us <= 10'b0;
+			
+			clk_2us <= 1'b0;
+			clk_2ms <= 1'b0;
+			clk_25us <= 1'b0;
+		end
+		////////////////////////////////////////////////////////////////////////////////////////
+//		else if(!start_rst)begin
+//			count_2us <= 6'b0;
+//			clk_2us <= 1'b0;
+//		end
+		////////////////////////////////////////////////////////////////////////////////////////
+		else begin
+			count_2us <= count_2us + 1;
+			count_2ms <= count_2ms + 1;
+			count_25us <= count_25us + 1;
+			
+			if(count_2us == 6'b100111)begin
+				clk_2us <= ~clk_2us;
+				count_2us <= 6'b0;
+			end
+			if(count_2ms == 80000)begin
+				clk_2ms <= ~clk_2ms;
+				count_2ms <= 17'b0;
+			end
+			if(count_25us == 1000)begin
+				clk_25us <= ~clk_25us;
+				count_25us <= 10'b0;
+			end
+		end
+	end
+endmodule
